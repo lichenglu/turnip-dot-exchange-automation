@@ -98,6 +98,7 @@ async function checkPrices({ browser, atPrice }) {
 		await page.close();
 		return listings;
 	} catch (err) {
+		await page.close();
 		logger.red(err);
 	}
 }
