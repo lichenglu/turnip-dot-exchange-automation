@@ -33,11 +33,10 @@ const ROLLING_JOIN = false;
 const BAD_WORDS =
 	"fake price|not real|fee is(\\s+)?(.+)?|leave a tip of(\\s+)?(.+)?|[3-9] nmt";
 
-async function checkPrices({ browser, atPrice }) {
+async function checkPrices({ page, atPrice }) {
 	try {
 		const now = dayjs().format("MM/DD/YYYY hh:mm");
 		// /img/turnip.0cf2478d.png
-		const page = await browser.newPage();
 		await page.goto("https://turnip.exchange/islands");
 		await page.evaluate((values) => {
 			for (const key in values) {
@@ -95,10 +94,8 @@ async function checkPrices({ browser, atPrice }) {
 		} else {
 			logger.red(`Bad price\n`);
 		}
-		await page.close();
 		return listings;
 	} catch (err) {
-		await page.close();
 		logger.red(err);
 	}
 }
@@ -113,6 +110,16 @@ function initCount(list) {
 	});
 }
 
+function _updateIsland(list, ...pairs) {
+	const stats = VISITED_COUNT_TABLE.get(list.code);
+	if (stats) {
+		for (const pair of pairs) {
+			stats[pair.key] = pair.value;
+		}
+		VISITED_COUNT_TABLE.set(list.code, stats);
+	}
+}
+
 function increaseCount(list) {
 	const stats = VISITED_COUNT_TABLE.get(list.code);
 	if (stats) {
@@ -124,23 +131,15 @@ function increaseCount(list) {
 }
 
 function toggleJoined(list, toggle = true) {
-	const stats = VISITED_COUNT_TABLE.get(list.code);
-	if (stats) {
-		VISITED_COUNT_TABLE.set(list.code, {
-			...stats,
-			joined: toggle,
-		});
-	}
+	_updateIsland(list, { key: "joined", value: toggle });
 }
 
 function removeVisit(list) {
-	const stats = VISITED_COUNT_TABLE.get(list.code);
-	if (stats) {
-		VISITED_COUNT_TABLE.set(list.code, {
-			...stats,
-			removed: true,
-		});
-	}
+	_updateIsland(list, { key: "removed", value: true });
+}
+
+function updateDodoCode(list, code) {
+	_updateIsland(list, { key: "dodoCode", value: true });
 }
 
 async function waitForIsland({ list, browser }) {
@@ -150,16 +149,52 @@ async function waitForIsland({ list, browser }) {
 	await page.waitForSelector("div#app div.grid button.bg-primary");
 
 	page.on("close", () => {
-		toggleJoined(list);
 		clearInterval(timer);
+		toggleJoined(list);
 		removeVisit(list);
 		logger.red(`You have closed ${list.url}`);
 	});
 
 	const timer = setInterval(async () => {
+		const updatedList = VISITED_COUNT_TABLE.get(list.code);
+
+		if (updatedList && !updatedList.joined) {
+			await page.evaluate(() => {
+				const btn = document.evaluate(
+					"//button[contains(., 'Join this queue')]",
+					document,
+					null,
+					XPathResult.FIRST_ORDERED_NODE_TYPE,
+					null
+				).singleNodeValue;
+				if (btn) {
+					btn.click();
+				}
+			});
+			const joined = await page.evaluate(() => {
+				const btn = document.evaluate(
+					"//button[text()=' Join ']",
+					document,
+					null,
+					XPathResult.FIRST_ORDERED_NODE_TYPE,
+					null
+				).singleNodeValue;
+				if (btn) {
+					btn.click();
+					return true;
+				}
+				return false;
+			});
+
+			if (joined) {
+				logger.green(`You have joined ${list.url}`);
+				toggleJoined(list);
+			}
+		}
+
 		await page.evaluate(() => {
 			const btn = document.evaluate(
-				"//button[contains(., 'Join this queue')]",
+				`//p[contains(., "Click to see the Dodo Code")]`,
 				document,
 				null,
 				XPathResult.FIRST_ORDERED_NODE_TYPE,
@@ -169,24 +204,30 @@ async function waitForIsland({ list, browser }) {
 				btn.click();
 			}
 		});
-		const joined = await page.evaluate(() => {
-			const btn = document.evaluate(
-				"//button[text()=' Join ']",
+
+		const dodoCode = await page.evaluate(() => {
+			const desc = document.evaluate(
+				`//p[contains(., "It's your time to shine. Grab the Dodo Code below and get in there")]`,
 				document,
 				null,
 				XPathResult.FIRST_ORDERED_NODE_TYPE,
 				null
 			).singleNodeValue;
-			if (btn) {
-				btn.click();
-				return true;
+			if (desc && desc.nextSibling) {
+				const dodoCode = desc.nextSibling.textContent;
+				if (!dodoCode.includes("Click to see the Dodo Code")) {
+					return dodoCode;
+				}
 			}
-			return false;
 		});
+
 		increaseCount(list);
-		if (joined) {
-			logger.green(`You have joined ${list.url}`);
-			toggleJoined(list);
+
+		if (dodoCode) {
+			logger.green(`You have received dodo code: ${list.url}`);
+			logger.green(`DodoCode: ${dodoCode}`);
+			logger.green(`Price: ${list.price}`);
+			updateDodoCode(list);
 			clearInterval(timer);
 		}
 	}, 100);
@@ -194,19 +235,18 @@ async function waitForIsland({ list, browser }) {
 
 function checkIfCanJoinNewIsland() {
 	if (ROLLING_JOIN) {
-		if (VISITED_COUNT_TABLE.size <= MAX_VISITS) {
+		if (VISITED_COUNT_TABLE.size < MAX_VISITS) {
 			return true;
 		} else {
 			return (
-				Array.from(VISITED_COUNT_TABLE.values()).filter(
-					(v) => v.joined === false
-				).length <= MAX_VISITS
+				Array.from(VISITED_COUNT_TABLE.values()).filter((v) => !v.joined)
+					.length < MAX_VISITS
 			);
 		}
 	} else {
 		return (
 			Array.from(VISITED_COUNT_TABLE.values()).filter((v) => !v.removed)
-				.length <= MAX_VISITS
+				.length < MAX_VISITS
 		);
 	}
 }
@@ -217,7 +257,6 @@ function normalizeLists(lists) {
 			return !RegExp(BAD_WORDS, "i").test(list.description);
 		})
 		.sort((a, b) => b.price - a.price);
-	console.log(normed);
 	return normed;
 }
 
@@ -233,23 +272,28 @@ async function batchWaitForIsland({ lists, browser }) {
 	}
 }
 
-async function listenForTurnipPrices(atPrice = 150) {
-	const browser = await puppeteer.launch({ headless: false, devtools: true });
-	const lists = await checkPrices({ atPrice, browser });
-	batchWaitForIsland({ lists, browser });
-	setInterval(async () => {
-		if (!checkIfCanJoinNewIsland()) {
-			logger.red(
-				`You are currently waiting for ${
-					Array.from(VISITED_COUNT_TABLE.values()).filter((v) => !v.removed)
-						.length
-				} simultaneously.`
-			);
-			return;
-		}
-		const lists = await checkPrices({ atPrice, browser });
+async function listenForTurnipPrices(atPrice = 200) {
+	try {
+		const browser = await puppeteer.launch({ headless: false, devtools: true });
+		const page = await browser.newPage();
+		const lists = await checkPrices({ atPrice, page });
 		batchWaitForIsland({ lists, browser });
-	}, 1000 * 10);
+		setInterval(async () => {
+			if (!checkIfCanJoinNewIsland()) {
+				logger.red(
+					`You are currently waiting for ${
+						Array.from(VISITED_COUNT_TABLE.values()).filter((v) => !v.removed)
+							.length
+					} simultaneously.`
+				);
+				return;
+			}
+			const lists = await checkPrices({ atPrice, page });
+			batchWaitForIsland({ lists, browser });
+		}, 1000 * 10);
+	} catch (err) {
+		logger.red(`Exception: ${err.message}`);
+	}
 }
 
 listenForTurnipPrices();
